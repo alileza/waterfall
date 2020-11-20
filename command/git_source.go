@@ -12,8 +12,21 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
+var initcql = `
+CREATE CONSTRAINT unique_repository_id
+ON (repository:Repository) ASSERT repository.id IS UNIQUE;
+
+CREATE CONSTRAINT unique_author_id
+ON (author:Author) ASSERT author.id IS UNIQUE;
+
+CREATE CONSTRAINT unique_commit_hash
+ON (commit:Commit) ASSERT commit.hash IS UNIQUE;
+`
+
 var GitSourceInputs struct {
-	Repository string
+	Neo4jURI    string
+	Repository  string
+	InitCQLPath string
 }
 
 var GitSourceCommand *cli.Command = &cli.Command{
@@ -26,6 +39,18 @@ var GitSourceCommand *cli.Command = &cli.Command{
 			Destination: &GitSourceInputs.Repository,
 			Aliases:     []string{"r"},
 			Required:    true,
+		},
+		&cli.StringFlag{
+			Name:        "neo4j-uri",
+			Destination: &GitSourceInputs.Neo4jURI,
+			Aliases:     []string{"u"},
+			Value:       "bolt://localhost:7687",
+		},
+		&cli.StringFlag{
+			Name:        "initcql-path",
+			Destination: &GitSourceInputs.InitCQLPath,
+			Aliases:     []string{"p"},
+			Value:       "bolt://localhost:7687",
 		},
 	},
 	Action: func(c *cli.Context) error {
@@ -55,7 +80,7 @@ var GitSourceCommand *cli.Command = &cli.Command{
 			return err
 		}
 
-		driver, err := neo4j.NewDriver("bolt://localhost:7687", neo4j.NoAuth(), func(c *neo4j.Config) {
+		driver, err := neo4j.NewDriver(GitSourceInputs.Neo4jURI, neo4j.NoAuth(), func(c *neo4j.Config) {
 			c.Encrypted = false
 		})
 		if err != nil {
@@ -69,6 +94,12 @@ var GitSourceCommand *cli.Command = &cli.Command{
 		}
 		defer session.Close()
 
+		// init constraints
+		_, err = session.Run(initcql, nil)
+		if err != nil {
+			log.Println("failed to init constraints: ", err)
+		}
+
 		_, err = session.Run(`CREATE (a:Repository) SET a.id = $id`, map[string]interface{}{"id": u.Path})
 		if err != nil {
 			return fmt.Errorf("failed to create Repository node: %w", err)
@@ -79,7 +110,7 @@ var GitSourceCommand *cli.Command = &cli.Command{
 			if err != nil {
 				return fmt.Errorf("failed to create Author node: %w", err)
 			}
-			commit.String()
+
 			_, err = session.Run(`
 			MATCH (r:Repository), (a:Author) 
 				WHERE 
