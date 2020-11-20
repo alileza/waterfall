@@ -5,6 +5,8 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/object"
@@ -12,21 +14,9 @@ import (
 	"github.com/urfave/cli/v2"
 )
 
-var initcql = `
-CREATE CONSTRAINT unique_repository_id
-ON (repository:Repository) ASSERT repository.id IS UNIQUE;
-
-CREATE CONSTRAINT unique_author_id
-ON (author:Author) ASSERT author.id IS UNIQUE;
-
-CREATE CONSTRAINT unique_commit_hash
-ON (commit:Commit) ASSERT commit.hash IS UNIQUE;
-`
-
 var GitSourceInputs struct {
-	Neo4jURI    string
-	Repository  string
-	InitCQLPath string
+	Neo4jURI   string
+	Repository string
 }
 
 var GitSourceCommand *cli.Command = &cli.Command{
@@ -44,12 +34,6 @@ var GitSourceCommand *cli.Command = &cli.Command{
 			Name:        "neo4j-uri",
 			Destination: &GitSourceInputs.Neo4jURI,
 			Aliases:     []string{"u"},
-			Value:       "bolt://localhost:7687",
-		},
-		&cli.StringFlag{
-			Name:        "initcql-path",
-			Destination: &GitSourceInputs.InitCQLPath,
-			Aliases:     []string{"p"},
 			Value:       "bolt://localhost:7687",
 		},
 	},
@@ -80,58 +64,80 @@ var GitSourceCommand *cli.Command = &cli.Command{
 			return err
 		}
 
-		driver, err := neo4j.NewDriver(GitSourceInputs.Neo4jURI, neo4j.NoAuth(), func(c *neo4j.Config) {
-			c.Encrypted = false
-		})
+		return sourceNeo4j(u.Path, iter)
+	},
+}
+
+func sourceNeo4j(repositoryID string, iter object.CommitIter) error {
+	driver, err := neo4j.NewDriver(GitSourceInputs.Neo4jURI, neo4j.NoAuth(), func(c *neo4j.Config) {
+		c.Encrypted = false
+	})
+	if err != nil {
+		return err
+	}
+	defer driver.Close()
+
+	session, err := driver.Session(neo4j.AccessModeWrite)
+	if err != nil {
+		return fmt.Errorf("failed to start session: %w", err)
+	}
+	defer session.Close()
+
+	for _, q := range []string{
+		`CREATE CONSTRAINT unique_repository_id ON (repository:Repository) ASSERT repository.id IS UNIQUE`,
+		`CREATE CONSTRAINT unique_author_id ON (author:Author) ASSERT author.id IS UNIQUE`,
+	} {
+		result, err := session.Run(q, nil)
 		if err != nil {
 			return err
 		}
-		defer driver.Close()
-
-		session, err := driver.Session(neo4j.AccessModeWrite)
-		if err != nil {
-			return fmt.Errorf("failed to start session: %w", err)
+		if result.Err() != nil && !strings.Contains(result.Err().Error(), "xists") {
+			return result.Err()
 		}
-		defer session.Close()
+	}
 
-		// init constraints
-		_, err = session.Run(initcql, nil)
-		if err != nil {
-			log.Println("failed to init constraints: ", err)
-		}
+	_, err = session.Run(`CREATE (a:Repository) SET a.id = $id`, map[string]interface{}{"id": repositoryID})
+	if err != nil {
+		return fmt.Errorf("failed to create Repository node: %w", err)
+	}
 
-		_, err = session.Run(`CREATE (a:Repository) SET a.id = $id`, map[string]interface{}{"id": u.Path})
+	if err := iter.ForEach(func(commit *object.Commit) error {
+		_, err = session.Run(`CREATE (a:Author) SET a.id = $id`, map[string]interface{}{"id": commit.Author.Email})
 		if err != nil {
-			return fmt.Errorf("failed to create Repository node: %w", err)
+			return fmt.Errorf("failed to create Author node: %w", err)
 		}
 
-		if err := iter.ForEach(func(commit *object.Commit) error {
-			_, err = session.Run(`CREATE (a:Author) SET a.id = $id`, map[string]interface{}{"id": commit.Author.Email})
-			if err != nil {
-				return fmt.Errorf("failed to create Author node: %w", err)
-			}
+		result, err := session.Run(`
+		MATCH (r:Repository {id: $repository_id}), (a:Author {id: $author_id}) 
+		MERGE (a)-[c:COMMIT { hash: $hash, timestamp: datetime($timestamp) }]->(r)
+		RETURN type(c), c.hash`,
+			map[string]interface{}{
+				"repository_id": repositoryID,
+				"author_id":     commit.Author.Email,
+				"hash":          commit.Hash.String(),
+				"timestamp":     commit.Committer.When.Format(time.RFC3339),
+			})
+		if err != nil {
+			return fmt.Errorf("failed to create Commit relationship: %w", err)
+		}
+		if result.Err() != nil {
+			return fmt.Errorf("failed to create Commit relationship result: %w", result.Err())
+		}
 
-			_, err = session.Run(`
-			MATCH (r:Repository), (a:Author) 
-				WHERE 
-					r.id = $repository_id 
-					AND 
-					a.id = $author_id
-			CREATE (a)-[c:Commit { hash: $hash }]->(r)
-			RETURN type(c), c.hash`,
-				map[string]interface{}{
-					"repository_id": u.Path,
-					"author_id":     commit.Author.Email,
-					"hash":          commit.Hash.String(),
-				})
-			if err != nil {
-				return fmt.Errorf("failed to create Commit node: %w", err)
-			}
-			return nil
-		}); err != nil {
-			return err
+		_, err = session.Run(`MERGE (c:COMMIT { hash: $hash }) RETURN c`,
+			map[string]interface{}{
+				"hash": commit.Hash.String(),
+			})
+		if err != nil {
+			return fmt.Errorf("failed to create Commit relationship: %w", err)
+		}
+		if result.Err() != nil {
+			return fmt.Errorf("failed to create Commit relationship result: %w", result.Err())
 		}
 
 		return nil
-	},
+	}); err != nil {
+		return err
+	}
+	return nil
 }

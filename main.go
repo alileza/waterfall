@@ -6,12 +6,12 @@ import (
 
 	"github.com/urfave/cli/v2"
 
-	"waterflow/command"
+	"waterfall/command"
 )
 
 func main() {
 	app := &cli.App{
-		Name:  "waterflow",
+		Name:  "waterfall",
 		Usage: "Command line tools to generate events",
 		Commands: []*cli.Command{
 			command.GitCommand,
